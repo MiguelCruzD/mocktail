@@ -1,3 +1,4 @@
+#include <sys/ucontext.h>
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -95,6 +96,54 @@ std::atomic<bool> g_allow_host_abi_bridges{false};
 std::atomic<bool> g_allow_host_constructor_replay{false};
 std::atomic<const mocktail::compat::HostAbiProfile*>
     g_active_host_abi_profile{nullptr};
+
+#if defined(__x86_64__)  // <--- FALTA ESTA LÍNEA
+
+void my_sigill_handler(int sig, siginfo_t *info, void *ucontext) {
+    ucontext_t *ctx = (ucontext_t *)ucontext;
+    // En Linux x86_64, el puntero de instrucción es REG_RIP
+    uint8_t *rip = (uint8_t *)ctx->uc_mcontext.gregs[REG_RIP];
+
+    // Buscamos la instrucción pcmpgtq (Bytes: 66 0F 38 37)
+    if (rip[0] == 0x66 && rip[1] == 0x0F && rip[2] == 0x38 && rip[3] == 0x37) {
+        printf("\n[HACK] ¡Atrapado pcmpgtq! Emulando...\n");
+        
+        // Asumiendo que la instrucción es pcmpgtq xmm1, xmm0 (como en tus logs)
+        uint64_t xmm0_low = ctx->uc_mcontext.fpregs->_xmm[0].element[0];
+        uint64_t xmm0_high = ctx->uc_mcontext.fpregs->_xmm[0].element[1];
+        uint64_t xmm1_low = ctx->uc_mcontext.fpregs->_xmm[1].element[0];
+        uint64_t xmm1_high = ctx->uc_mcontext.fpregs->_xmm[1].element[1];
+
+        // Hacemos la comparación con signo de 64 bits (int64_t)
+        int64_t x0_l = (int64_t)xmm0_low;
+        int64_t x0_h = (int64_t)xmm0_high;
+        int64_t x1_l = (int64_t)xmm1_low;
+        int64_t x1_h = (int64_t)xmm1_high;
+
+        // Si el registro 1 es mayor que el 0, ponemos todos los bits a 1 (0xFFFF...)
+        ctx->uc_mcontext.fpregs->_xmm[1].element[0] = (x1_l > x0_l) ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+        ctx->uc_mcontext.fpregs->_xmm[1].element[1] = (x1_h > x0_h) ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+
+        // Avanzamos el puntero de instrucción 5 bytes para no volver a ejecutarla
+        ctx->uc_mcontext.gregs[REG_RIP] += 5; 
+        return; 
+    }
+
+    // Si es otra instrucción (como crc32 o pcmpistri), dejamos que el programa muera
+    printf("\n[FATAL] Instrucción desconocida en RIP: %p\n", rip);
+    signal(SIGILL, SIG_DFL);
+}
+
+void setup_sse42_emulation() {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = my_sigill_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGILL, &sa, NULL);
+    printf("  [compat] Manejador SIGILL para emular SSE4.2 instalado.\n");
+}
+
+#endif // <--- ESTE CIERRA EL #if DE ARRIBA
 
 namespace {
 
@@ -5700,6 +5749,7 @@ int mocktail::legacy::Run(const runtime::CommandLineOptions& options,
   PreloadPthreadSymbols();
 
   std::cout << "  Library path: " << library_path << '\n';
+	setup_sse42_emulation();
   linker::LibraryHandle roblox_handle =
       linker::LoadLibrary(library_path, "libroblox");
 
